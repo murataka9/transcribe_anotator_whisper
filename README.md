@@ -2,11 +2,14 @@
 
 音声インタビューを **文字起こし → 話者ラベル付け・誤字修正 → テキスト書き出し** するためのローカルツール一式です。
 
-2つのスクリプトから成ります。
+4つのスクリプトから成ります。文字起こしは `transcribe.py` か `diarize_d1.py` の
+どちらかで作り（話者分離が要るなら後者）、外で作ったものは `import_whisper.py` で取り込みます。
 
 | スクリプト | 役割 |
 | --- | --- |
 | `transcribe.py` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) を使い、ディレクトリ内の音声を一括で文字起こし |
+| `diarize_d1.py` | 文字起こしの本文を変えずに話者分離を足す（推奨パイプライン） |
+| `import_whisper.py` | 外で作った文字起こし（JSON/SRT）を `recordings/` に取り込む |
 | `annotator.py` | 文字起こしと音声をブラウザ上で並べ、発話者ロールのラベル付け・誤字修正・書き出しを行うGUI |
 
 最終出力は MAXQDA などに読み込める、行頭にロールを括弧書きしたシンプルなテキストです。
@@ -95,6 +98,26 @@ python transcribe.py recordings --device cuda
 - `<名前>_text.txt` … テキストのみ
 
 例: `recordings/P7.m4a` → `recordings/P7_timecoded.txt`, `recordings/P7_text.txt`
+
+### 外で作った文字起こしを取り込む（`import_whisper.py`）
+
+すでに別の場所で文字起こし済みの場合（GPU機で回した、録音アプリが書き出した、
+WhisperX を直接使ったなど）は、取り込むだけで済みます。
+
+```bash
+python import_whisper.py <音声とJSON/SRTのあるディレクトリ>
+# 音声を実体でコピーする（既定はシンボリックリンク）:
+python import_whisper.py <ディレクトリ> --copy
+```
+
+指定したディレクトリ配下の JSON（Whisper / WhisperX）と SRT を読み、`recordings/` に
+アノテーターが読める `<音声名>_timecoded.txt` と音声を作ります。
+
+**音声とトランスクリプトの組は、ファイル名ではなく「長さ」で突き合わせます。**
+録音アプリが書き出すトランスクリプトは音声とファイル名が食い違うことが多く、
+名前で対応させると人手で並べ替える羽目になるためです。トランスクリプトの末尾時刻と
+音声長がいちばん近いものを組にし、差が大きすぎるもの（既定 60秒。`--tolerance` で変更）は
+組にせず警告します。音声長の取得に `ffprobe` を使います。
 
 ---
 
@@ -330,6 +353,7 @@ CPU でも `--device cpu` で動きますが、実用的な速度は出ません
 
 ```
 transcribe.py            文字起こしスクリプト
+import_whisper.py        外で作った文字起こし（JSON/SRT）を recordings/ に取り込む
 diarize_d1.py            推奨の話者分離パイプライン（本文を変えずに話者を足す）
 annotator.py             アノテーターのローカルサーバー（標準ライブラリのみ）
 webui/                   アノテーターの画面（index.html / app.js / style.css）
