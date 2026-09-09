@@ -30,6 +30,11 @@ def main():
     tok_file = os.path.expanduser("~/.config/whisperx/hf_token")
     if not hf_token and os.path.exists(tok_file):
         hf_token = open(tok_file).read().strip()
+    if not hf_token:
+        # トークンが無くても pyannote がキャッシュ済みなら回せる。ネットに出ず
+        # キャッシュから読む。これを付けないとゲート付きモデルを取りに行って
+        # 401 で落ちる。interview.sh と同じ逃がし方。
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
     # --- 1. 素の faster-whisper。transcribe.py と同じ設定にそろえる
     print("1/3 文字起こし (%s)…" % args.model, flush=True)

@@ -34,6 +34,7 @@
   <input type="range" id="seekbar" class="seekbar" min="0" max="1000" value="0" step="1" title="再生位置（ドラッグでシーク）">
 
   <div class="group">
+    <button id="jobBtn" title="音声を追加して、文字起こしと話者分離を回す">文字起こし</button>
     <button id="rolesBtn" title="話者の人数と名前をまとめて編集する">話者を登録</button>
     <button id="diarBtn" title="話者分離の結果を読み込んで自動で割り当てる">話者を読み込む</button>
   </div>
@@ -110,6 +111,79 @@
     <div class="panel-foot">
       <span id="diarNote" class="muted-sm"></span>
       <button id="diarApply" class="primary" style="margin-left:auto">割り当てて照合へ</button>
+    </div>
+  </div>
+</div>
+
+<div id="jobOverlay" class="overlay" hidden>
+  <div class="panel">
+    <div class="panel-head">
+      <h2>文字起こし・話者分離</h2>
+      <button id="jobClose" style="margin-left:auto">閉じる</button>
+    </div>
+
+    <div id="jobAdd">
+      <h3 class="panel-sub">ファイルを追加</h3>
+      <p class="muted-sm">
+        取り込み元から音声を選ぶと、収録のディレクトリに<strong>実体をコピー</strong>します。
+        同じ名前が既にあるときは、上書きするか両方残すかを聞きます。
+      </p>
+      <div class="group" style="padding:0 0 8px">
+        <input type="text" id="jobSourceDir" class="dir-input" spellcheck="false"
+               title="取り込み元のディレクトリ">
+        <button id="jobBrowse">開く</button>
+      </div>
+      <div id="jobSourceList" class="repl-rows"></div>
+    </div>
+
+    <div id="jobRun" hidden>
+      <h3 class="panel-sub">処理する</h3>
+      <p class="muted-sm" id="jobTarget"></p>
+      <div class="job-rows">
+        <label class="job-row">
+          <input type="checkbox" id="jobDoTranscribe">
+          <span class="job-label">文字起こし</span>
+          <!-- 選択肢は models.json から作る（fillModels） -->
+          <select id="jobModel" title="使うモデル"></select>
+          <span class="muted-sm" id="jobTEst"></span>
+        </label>
+        <div class="job-note muted-sm" id="jobModelNote"></div>
+        <label class="job-row">
+          <input type="checkbox" id="jobDoDiarize">
+          <span class="job-label">話者分離</span>
+          <select id="jobSpeakers" title="話者の人数">
+            <option value="">自動</option>
+            <option value="2">2人</option>
+            <option value="3">3人</option>
+            <option value="4">4人</option>
+            <option value="5">5人</option>
+            <option value="6">6人</option>
+            <option value="7">7人</option>
+            <option value="8">8人</option>
+            <option value="9">9人</option>
+          </select>
+          <span class="muted-sm" id="jobDEst"></span>
+        </label>
+      </div>
+      <div id="jobWarn" class="job-warn" hidden></div>
+      <div id="jobProgress" class="job-progress" hidden></div>
+    </div>
+
+    <div class="panel-foot">
+      <span id="jobNote" class="muted-sm"></span>
+      <button id="jobStart" class="primary" style="margin-left:auto">実行</button>
+    </div>
+  </div>
+</div>
+
+<div id="confirmOverlay" class="overlay" hidden>
+  <div class="panel panel-narrow">
+    <div class="panel-head"><h2 id="confirmTitle">確認</h2></div>
+    <div id="confirmBody" class="confirm-body"></div>
+    <div class="panel-foot">
+      <button id="confirmCancel">やめる</button>
+      <button id="confirmKeep" style="margin-left:auto">両方残す</button>
+      <button id="confirmOver" class="danger">上書きする</button>
     </div>
   </div>
 </div>
