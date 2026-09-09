@@ -810,10 +810,37 @@ $("replClose").addEventListener("click", closeRepl);
 $("replAdd").addEventListener("click", () => { replacements.push({ from: "", to: "" }); renderReplRows(); });
 $("replSave").addEventListener("click", saveReplacements);
 $("replApply").addEventListener("click", applyReplacements);
-$("replOverlay").addEventListener("click", (e) => { if (e.target.id === "replOverlay") closeRepl(); });
+/** ダイアログの外side（背景）をクリックしたら閉じる。
+ *  押した場所と離した場所が **両方とも背景** のときだけ閉じる。
+ *  入力欄の文字を選ぼうとしてパネルの外までドラッグすると、click の
+ *  target が背景になり、名前を編集している最中に閉じてしまうため。 */
+function closeOnBackdrop(id, close) {
+  const ov = $(id);
+  let downOnBackdrop = false;
+  ov.addEventListener("mousedown", (e) => { downOnBackdrop = e.target === ov; });
+  ov.addEventListener("click", (e) => {
+    const ok = downOnBackdrop && e.target === ov;
+    downOnBackdrop = false;
+    if (ok) close();
+  });
+}
+
+closeOnBackdrop("replOverlay", closeRepl);
 // Escape はどのダイアログでも閉じる。手前（後から開いたもの）から順に。
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  // 日本語入力の変換中に押す Escape は「変換の取り消し」。ここで閉じてしまうと、
+  // 名前を打っている途中でダイアログが消え、続きのキーが本文のショートカットに
+  // 化ける（数字で話者が付く、D で行が消える）。
+  if (e.isComposing || e.keyCode === 229) return;
+  // 入力欄を触っている最中は、まず入力欄から抜けるだけにする。もう一度押すと閉じる。
+  const el = document.activeElement;
+  if (el && el.closest && el.closest(".overlay") &&
+      (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
+    e.stopPropagation();
+    el.blur();
+    return;
+  }
   for (const id of ["confirmOverlay", "jobOverlay", "rolesOverlay", "diarOverlay", "replOverlay"]) {
     if (!$(id).hidden) {
       e.stopPropagation();
@@ -959,7 +986,7 @@ $("rolesAdd").addEventListener("click", () => {
   renderRolesRows();
 });
 $("rolesSave").addEventListener("click", saveRoles);
-$("rolesOverlay").addEventListener("click", (e) => { if (e.target.id === "rolesOverlay") closeRoles(); });
+closeOnBackdrop("rolesOverlay", closeRoles);
 $("speakerCount").addEventListener("change", (e) => setDraftCount(parseInt(e.target.value, 10)));
 
 // ------------------------------------------------------------------ 話者分離の取り込み
@@ -1046,7 +1073,7 @@ async function applyDiar() {
 $("diarBtn").addEventListener("click", openDiar);
 $("diarClose").addEventListener("click", closeDiar);
 $("diarApply").addEventListener("click", applyDiar);
-$("diarOverlay").addEventListener("click", (e) => { if (e.target.id === "diarOverlay") closeDiar(); });
+closeOnBackdrop("diarOverlay", closeDiar);
 
 // ------------------------------------------------------------------ 文字起こし・話者分離
 // 実行はサーバー側の別プロセス。状態もサーバーが持つので、ページを閉じて
@@ -1372,7 +1399,7 @@ $("jobModel").addEventListener("change", () => {
   updateEstimates(jobProject);
 });
 $("jobSourceDir").addEventListener("keydown", (e) => { if (e.key === "Enter") loadSources(); });
-$("jobOverlay").addEventListener("click", (e) => { if (e.target.id === "jobOverlay") closeJob(); });
+closeOnBackdrop("jobOverlay", closeJob);
 
 // ページを開き直しても、走っている処理を拾い直す（状態はサーバーが持っている）
 pollJob().catch(() => {});
