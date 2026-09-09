@@ -325,3 +325,10 @@ button.danger { background: #c0392b; color: #fff; border-color: #c0392b; }
   flex: none; min-width: 92px; font-size: 11px; color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+
+/* 処理中のヘッダーボタン。ダイアログを閉じていても走っているのが分かる */
+#jobBtn.running {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}

@@ -1063,8 +1063,18 @@ function fmtDur(sec) {
 
 async function ensureCaps() {
   if (caps) return caps;
-  const r = await fetch("/api/capabilities");
-  const j = await r.json();
+  // 古いサーバーが動いていると 404 になる。annotator.py は起動時に一度しか
+  // 読まれないので、webui だけ新しくてサーバーが古い状態が起きうる。
+  // 黙って例外で止まると「押しても何も起きない」に見えるので、必ず知らせる。
+  let j;
+  try {
+    const r = await fetch("/api/capabilities");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    j = await r.json();
+  } catch (e) {
+    toast("サーバーが古いようです。annotator.py を再起動してください");
+    return null;
+  }
   caps = j.capabilities || {};
   caps.source_dir = j.source_dir || "";
   return caps;
@@ -1079,6 +1089,9 @@ function confirmOverwrite(title, html, opts) {
     $("confirmBody").innerHTML = html;
     $("confirmKeep").hidden = !opts.allowKeepBoth;
     $("confirmOver").textContent = opts.overwriteLabel || "上書きする";
+    // 破壊的でない確認（「割り当てますか」など）は赤くしない
+    $("confirmOver").classList.toggle("danger", opts.danger !== false);
+    $("confirmCancel").textContent = opts.cancelLabel || "やめる";
     $("confirmOverlay").hidden = false;
     const done = (v) => {
       $("confirmOverlay").hidden = true;
@@ -1092,7 +1105,7 @@ function confirmOverwrite(title, html, opts) {
 }
 
 async function openJob() {
-  await ensureCaps();
+  if (!(await ensureCaps())) return;   // サーバーが古い等。toast 済み
   $("jobOverlay").hidden = false;
   $("jobSourceDir").value = $("jobSourceDir").value || caps.source_dir || "";
   setJobTarget(state && state.has_audio ? state.name : null);
@@ -1102,7 +1115,8 @@ async function openJob() {
 
 function closeJob() {
   $("jobOverlay").hidden = true;
-  if (jobPoll) { clearInterval(jobPoll); jobPoll = null; }
+  // ポーリングは止めない。処理はサーバー側で走っているので、ダイアログを
+  // 閉じてアノテーションを続けられる。終わったらここで気づける。
 }
 
 async function loadSources() {
@@ -1249,15 +1263,59 @@ async function pollJob() {
     await loadProjectList();
     if (j.status === "done") {
       toast("完了しました: " + j.name);
-      await loadProject(j.name);
-      $("projectSel").value = j.name;
-      await setJobTarget(j.name);
+      // 編集中の収録を横から差し替えない。別の収録を触っていたら知らせるだけ。
+      if (!state || state.name === j.name || !dirty) {
+        await loadProject(j.name);
+        $("projectSel").value = j.name;
+      }
+      if (!$("jobOverlay").hidden) await setJobTarget(j.name);
+      await offerAssign(j);
+    } else if (j.status === "failed") {
+      toast("失敗しました: " + (j.error || j.name));
     }
   }
 }
 
+/** 話者分離まで終わったら、そのまま割り当てるか聞く。
+ *  黙って割り当てない。全行を振り直すので、手で付けたラベルが消えるため。 */
+async function offerAssign(j) {
+  const diarized = j.stages.some((s) => s.key === "diarize" && s.status === "done");
+  // 別の収録を編集中なら聞かない（その収録に割り当ててしまうため）
+  if (!diarized || !state || state.name !== j.name || !state.diarization) return;
+
+  const labeled = state.segments.filter((s) => s.role).length;
+  const body =
+    "話者分離が終わりました。<strong>全行に話者を割り当てますか。</strong>" +
+    (labeled ? "<ul><li>いま話者が付いている " + labeled +
+               "行は、分離の結果で置き換わります（⌘Z で戻せます）</li></ul>"
+             : "<ul><li>割り当てたあと、誰がどの話者かを「話者を登録」で照合します</li></ul>");
+  const ok = await confirmOverwrite("話者を割り当てますか", body,
+    { allowKeepBoth: false, overwriteLabel: "割り当てる",
+      cancelLabel: "あとで", danger: false });
+  if (!ok) return;
+  closeJob();
+  await openDiar();     // いつもの「話者を読み込む」の流れに合流する
+}
+
+/** ヘッダーのボタンに実行中を出す。ダイアログを閉じていても分かるように。 */
+function renderJobBadge(j) {
+  const btn = $("jobBtn");
+  const running = j && j.status === "running";
+  btn.classList.toggle("running", !!running);
+  if (running) {
+    const cur = j.stages.find((s) => s.status === "running");
+    btn.textContent = (cur ? cur.label : "処理") + "中… " + fmtDur(j.elapsed);
+    btn.title = j.name + " を処理しています。押すと進捗を見られます";
+  } else {
+    btn.textContent = "文字起こし";
+    btn.title = "音声を追加して、文字起こしと話者分離を回す";
+  }
+}
+
 function renderJob(j) {
+  renderJobBadge(j);
   const box = $("jobProgress");
+  if ($("jobOverlay").hidden) return;   // 閉じている間は中身を作らない
   box.hidden = false;
   const total = j.stages.reduce((a, s) => a + (s.estimate || 0), 0);
   const doneEst = j.stages.filter((s) => s.status === "done")
@@ -1285,3 +1343,6 @@ $("jobStart").addEventListener("click", startJob);
 $("jobBrowse").addEventListener("click", loadSources);
 $("jobSourceDir").addEventListener("keydown", (e) => { if (e.key === "Enter") loadSources(); });
 $("jobOverlay").addEventListener("click", (e) => { if (e.target.id === "jobOverlay") closeJob(); });
+
+// ページを開き直しても、走っている処理を拾い直す（状態はサーバーが持っている）
+pollJob().catch(() => {});
