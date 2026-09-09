@@ -128,8 +128,10 @@ async function loadProjectList() {
     const opt = document.createElement("option");
     opt.value = p.name;
     // 文字起こしがまだのものも一覧に出る。ここに出ないと処理を始められない。
+    // ただしアノテーションを受け取っただけの収録（.annot.json はあるが
+    // _timecoded.txt が無い）は「未文字起こし」ではないので出さない。
     opt.textContent = p.name + (p.annotated ? " ●" : "")
-                    + (p.transcribed ? "" : "（未文字起こし）")
+                    + (p.transcribed || p.annotated ? "" : "（未文字起こし）")
                     + (p.audio ? "" : "（音声なし）");
     sel.appendChild(opt);
   }
@@ -160,7 +162,9 @@ async function loadProject(name) {
   $("optTime").checked = !!state.options.timecodes;
   setSaveState("");
   renderRoles();
-  if (state.transcribed === false) {
+  // 行があるなら出す。他の端末から .annot.json だけ受け取った場合、
+  // _timecoded.txt が無くても中身は揃っている（transcribed だけでは判断しない）。
+  if (state.transcribed === false && !state.segments.length) {
     // 音声だけ置かれている状態。行が無いので、次にやることを出す。
     $("segments").innerHTML = "";
     $("emptyMsg").innerHTML =
