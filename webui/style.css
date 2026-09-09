@@ -277,6 +277,36 @@ kbd {
 .panel-foot button { flex: none; white-space: nowrap; }
 .repl-empty { color: var(--muted); font-size: 13px; padding: 18px 4px; text-align: center; }
 
+/* --- 文字起こし・話者分離のダイアログ ------------------------------- */
+.panel-sub { font-size: 13px; margin: 10px 0 4px; color: var(--muted); font-weight: 600; }
+.panel-narrow { max-width: 460px; }
+.dir-input {
+  flex: 1; min-width: 0; font: inherit; font-size: 13px; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink);
+}
+.src-row { display: flex; align-items: center; gap: 10px; padding: 4px 2px; }
+.src-row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.src-row .meta { flex: none; color: var(--muted); font-size: 12px; }
+.job-rows { display: flex; flex-direction: column; gap: 8px; padding: 8px 2px; }
+.job-row { display: flex; align-items: center; gap: 10px; }
+.job-row .job-label { flex: none; min-width: 84px; font-weight: 600; }
+.job-row select { font: inherit; font-size: 13px; }
+.job-warn {
+  border-left: 3px solid var(--warn, #d08316); background: var(--accent-soft);
+  padding: 8px 10px; border-radius: 6px; font-size: 13px; line-height: 1.6; margin: 4px 0;
+}
+.job-progress { padding: 8px 2px; font-size: 13px; }
+.job-progress .stage { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.job-progress .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 6px 0; }
+.job-progress .bar > i { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+.job-progress .log {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+  color: var(--muted); white-space: pre-wrap; max-height: 84px; overflow-y: auto; margin-top: 6px;
+}
+.confirm-body { padding: 10px 2px; font-size: 14px; line-height: 1.7; }
+.confirm-body ul { margin: 8px 0 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+button.danger { background: #c0392b; color: #fff; border-color: #c0392b; }
+
 /* 行の「辞書へ」ボタン（編集済みの行にだけ出る） */
 .ops .to-dict { color: var(--accent); }
 

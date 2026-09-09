@@ -25,8 +25,17 @@ import bisect
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ここで import するのは標準ライブラリだけ。文字起こしや話者分離は別プロセスに
+# 投げるので、**アノテーターだけを使う人は何もインストールしなくていい**。
+# その前提は崩さないこと（README の「標準ライブラリのみで動く」はこの意味）。
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEBUI_DIR = os.path.join(BASE_DIR, "webui")
@@ -58,6 +67,46 @@ def audio_mime(path):
     return MIME.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
 
 
+def probe_duration(path):
+    """音声の秒数。ffprobe が無ければ None を返すだけで、動作には影響しない。"""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=20, check=True).stdout.strip()
+        return round(float(out), 2)
+    except Exception:
+        return None
+
+
+def capabilities():
+    """この環境で何ができるかを調べる。
+
+    アノテーターは標準ライブラリだけで動くので、文字起こしも話者分離も
+    「無ければ無いなりに」動かす。UI 側はここを見て、使えない機能を
+    押せなくする（押してから失敗するのが一番たちが悪い）。
+    """
+    def importable(mod):
+        try:
+            subprocess.run([sys.executable, "-c", "import " + mod],
+                           capture_output=True, timeout=60, check=True)
+            return True
+        except Exception:
+            return False
+
+    caps = {
+        "transcribe_mlx": (sys.platform == "darwin"
+                           and os.path.exists(os.path.join(BASE_DIR, "transcribe_mlx.py"))
+                           and importable("mlx_whisper")),
+        "diarize": (os.path.exists(os.path.join(BASE_DIR, "diarize_local.py"))
+                    and importable("pyannote.audio")),
+        "ffprobe": bool(shutil.which("ffprobe")),
+    }
+    return caps
+
+
 class Store:
     """recordings ディレクトリの走査と、アノテーション JSON の読み書き。"""
 
@@ -67,20 +116,38 @@ class Store:
 
     # --- 収録一覧 -----------------------------------------------------
     def list_projects(self):
-        """(*_timecoded.txt がある収録) の一覧を返す。"""
+        """収録の一覧を返す。
+
+        文字起こし済み（*_timecoded.txt がある）ものに加えて、**音声だけ置かれて
+        まだ文字起こししていないもの**も返す。ここに出てこないと、UI から
+        「これを文字起こしする」を選べないため。
+        """
         projects = []
         try:
             names = sorted(os.listdir(self.data_dir))
         except FileNotFoundError:
             return projects
+        found = []
+        seen = set()
         for fn in names:
-            if not fn.endswith("_timecoded.txt"):
+            if fn.endswith("_timecoded.txt"):
+                name = fn[: -len("_timecoded.txt")]
+            elif fn.lower().endswith(AUDIO_EXTENSIONS):
+                name = os.path.splitext(fn)[0]
+            else:
                 continue
-            name = fn[: -len("_timecoded.txt")]
+            if name not in seen:
+                seen.add(name)
+                found.append(name)
+        for name in sorted(found):
             audio = self._find_audio(name)
-            annot = os.path.exists(self._annot_path(name))
-            projects.append({"name": name, "audio": bool(audio), "annotated": annot,
-                             "diarization": bool(self.find_diarization(name))})
+            projects.append({
+                "name": name,
+                "audio": bool(audio),
+                "transcribed": os.path.exists(self._timecoded_path(name)),
+                "annotated": os.path.exists(self._annot_path(name)),
+                "diarization": bool(self.find_diarization(name)),
+            })
         return projects
 
     def _find_audio(self, name):
@@ -102,6 +169,80 @@ class Store:
     def _safe(self, name):
         # ディレクトリトラバーサル防止：基本ファイル名以外は拒否
         return name and ("/" not in name) and ("\\" not in name) and (".." not in name)
+
+    # --- ファイルを追加 ----------------------------------------------
+    # ブラウザは選んだファイルの実際のパスをページに渡さない（fakepath になる）。
+    # そのため「どのファイルか」はサーバー側で一覧を出して選んでもらう。
+    # 中身を HTTP で送らないので multipart の解析も不要になる。
+
+    def list_sources(self, dirpath):
+        """取り込み元ディレクトリの音声を一覧する。"""
+        dirpath = os.path.abspath(os.path.expanduser(dirpath))
+        if not os.path.isdir(dirpath):
+            return {"error": "not_a_dir", "dir": dirpath}
+        rows = []
+        for fn in sorted(os.listdir(dirpath)):
+            if not fn.lower().endswith(AUDIO_EXTENSIONS):
+                continue
+            path = os.path.join(dirpath, fn)
+            name = os.path.splitext(fn)[0]
+            rows.append({
+                "file": fn,
+                "size": os.path.getsize(path),
+                "duration": probe_duration(path),
+                # 同名が既にあるかは、押す前に見せておきたい
+                "exists": bool(self._find_audio(name)),
+            })
+        return {"dir": dirpath, "files": rows}
+
+    def add_source(self, dirpath, filename, mode="ask"):
+        """取り込み元の音声を recordings/ に実体コピーする。
+
+        mode は "ask"（既定・衝突したら何もせず知らせる）/ "overwrite" /
+        "keep_both"（連番を付けて両方残す）。黙って上書きしないための作り。
+        """
+        if not self._safe(filename):
+            return {"error": "bad_name"}
+        src = os.path.join(os.path.abspath(os.path.expanduser(dirpath)), filename)
+        if not os.path.isfile(src):
+            return {"error": "not_found"}
+
+        stem, ext = os.path.splitext(filename)
+        dest_name = stem
+        if self._find_audio(stem):
+            if mode == "ask":
+                return {"error": "exists", "name": stem,
+                        "artifacts": self.artifacts(stem)}
+            if mode == "keep_both":
+                i = 2
+                while self._find_audio("%s-%d" % (stem, i)):
+                    i += 1
+                dest_name = "%s-%d" % (stem, i)
+            elif mode != "overwrite":
+                return {"error": "bad_mode"}
+
+        dest = os.path.join(self.data_dir, dest_name + ext)
+        os.makedirs(self.data_dir, exist_ok=True)
+        tmp = dest + ".part"
+        with open(src, "rb") as fin, open(tmp, "wb") as fout:
+            shutil.copyfileobj(fin, fout, 1024 * 1024)
+        os.replace(tmp, dest)   # 途中で落ちても半端なファイルが残らない
+        return {"name": dest_name, "file": os.path.basename(dest),
+                "size": os.path.getsize(dest)}
+
+    def artifacts(self, name):
+        """この収録について既にある成果物。上書き確認で見せる。"""
+        rows = []
+        for label, path in (
+            ("文字起こし", self._timecoded_path(name)),
+            ("テキスト", os.path.join(self.data_dir, name + "_text.txt")),
+            ("単語の時刻", os.path.join(self.data_dir, name + ".words.json")),
+            ("話者分離", self.find_diarization(name) or ""),
+            ("アノテーション", self._annot_path(name)),
+        ):
+            if path and os.path.exists(path):
+                rows.append({"label": label, "file": os.path.basename(path)})
+        return rows
 
     # --- トランスクリプト解析 ----------------------------------------
     def parse_timecoded(self, name):
@@ -142,18 +283,26 @@ class Store:
             data.setdefault("options", {"merge": True, "timecodes": False})
             data.setdefault("origins", {})
         else:
-            if not os.path.exists(self._timecoded_path(name)):
+            audio_only = self._find_audio(name) and not os.path.exists(self._timecoded_path(name))
+            if not os.path.exists(self._timecoded_path(name)) and not audio_only:
                 return None
             data = {
                 "name": name,
                 "roles": list(DEFAULT_ROLES),
                 "origins": {},
                 "options": {"merge": True, "timecodes": False},
-                "segments": self.parse_timecoded(name),
+                # まだ文字起こししていない収録は空で開く。UI 側で「文字起こし」を
+                # 促すため、存在しないものとして弾かない。
+                "segments": [] if audio_only else self.parse_timecoded(name),
             }
         audio = self._find_audio(name)
         data["name"] = name
         data["has_audio"] = bool(audio)
+        data["transcribed"] = os.path.exists(self._timecoded_path(name))
+        # 所要時間の目安に使う。ffprobe が無ければ None（目安が出ないだけ）。
+        data["duration"] = probe_duration(audio) if audio else None
+        data["has_words"] = os.path.exists(os.path.join(self.data_dir, name + ".words.json"))
+        data["diarization"] = bool(self.find_diarization(name))
         return data
 
     def reset_project(self, name):
@@ -447,8 +596,125 @@ class Store:
         return {"path": out, "lines": len(lines), "unlabeled": unlabeled}
 
 
+class JobRunner:
+    """文字起こし・話者分離を別プロセスで回し、進捗を持っておく。
+
+    状態をサーバー側に置くので、**ページを閉じて開き直しても進捗に戻れる**。
+    GPU を取り合わないよう、走らせるのは一度に1本だけ。
+    """
+
+    # 実測値（M4 / 日本語）。残り時間の目安を出すのに使う。
+    RATE = {"transcribe": 4.6, "diarize": 12.0}
+
+    def __init__(self, store):
+        self.store = store
+        self.lock = threading.Lock()
+        self.job = None
+
+    def snapshot(self):
+        with self.lock:
+            if not self.job:
+                return None
+            job = dict(self.job)
+            if job["status"] == "running":
+                # 文字起こしは途中で何も出力しないので、経過はここで数える
+                job["elapsed"] = round(time.time() - job["started"])
+            return job
+
+    def busy(self):
+        with self.lock:
+            return bool(self.job and self.job["status"] == "running")
+
+    def start(self, name, do_transcribe, do_diarize, speakers, model):
+        audio = self.store._find_audio(name)
+        if not audio:
+            return {"error": "no_audio"}
+        stages = []
+        duration = probe_duration(audio)
+        if do_transcribe:
+            stages.append({"key": "transcribe", "label": "文字起こし", "status": "waiting",
+                           "estimate": round(duration / self.RATE["transcribe"]) if duration else None})
+        if do_diarize:
+            stages.append({"key": "diarize", "label": "話者分離", "status": "waiting",
+                           "estimate": round(duration / self.RATE["diarize"]) if duration else None})
+        if not stages:
+            return {"error": "nothing_to_do"}
+
+        with self.lock:
+            if self.job and self.job["status"] == "running":
+                return {"error": "busy", "running": self.job["name"]}
+            self.job = {
+                "name": name, "status": "running", "stages": stages,
+                "speakers": speakers, "model": model, "started": time.time(),
+                "elapsed": 0, "current": stages[0]["key"], "log": [], "error": None,
+            }
+        threading.Thread(target=self._run, args=(name, audio), daemon=True).start()
+        return self.snapshot()
+
+    def _run(self, name, audio):
+        try:
+            for stage in list(self.job["stages"]):
+                self._set(current=stage["key"])
+                self._stage(stage["key"], "running")
+                cmd = self._command(stage["key"], audio)
+                code = self._spawn(cmd)
+                if code != 0:
+                    self._stage(stage["key"], "failed")
+                    self._set(status="failed",
+                              error="%s に失敗しました（終了コード %d）" % (stage["label"], code))
+                    return
+                self._stage(stage["key"], "done")
+            self._set(status="done")
+        except Exception as e:                        # 予期しない失敗も画面に出す
+            self._set(status="failed", error=str(e))
+
+    def _command(self, key, audio):
+        python = sys.executable
+        if key == "transcribe":
+            cmd = [python, os.path.join(BASE_DIR, "transcribe_mlx.py"), audio, "--overwrite"]
+            if self.job.get("model"):
+                cmd += ["--model", self.job["model"]]
+            return cmd
+        cmd = [python, os.path.join(BASE_DIR, "diarize_local.py"), audio, "--overwrite"]
+        if self.job.get("speakers"):
+            cmd += ["--speakers", str(self.job["speakers"])]
+        return cmd
+
+    def _spawn(self, cmd):
+        proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if "\r" in line:
+                line = line.split("\r")[-1].strip()   # 進捗バーは最後の状態だけ
+            # ライブラリの警告は画面に出さない。pyannote が毎回吐く
+            # RuntimeWarning などで、進捗の表示が埋まってしまうため。
+            noise = ("Warning:" in line or line.startswith(("Fetching ", "  ", "\t"))
+                     or "warnings.warn" in line or line.startswith("/"))
+            if line and not noise:
+                with self.lock:
+                    self.job["log"] = (self.job["log"] + [line])[-40:]
+                    self.job["elapsed"] = round(time.time() - self.job["started"])
+        return proc.wait()
+
+    def _set(self, **kw):
+        with self.lock:
+            self.job.update(kw)
+            self.job["elapsed"] = round(time.time() - self.job["started"])
+
+    def _stage(self, key, status):
+        with self.lock:
+            for s in self.job["stages"]:
+                if s["key"] == key:
+                    s["status"] = status
+            self.job["elapsed"] = round(time.time() - self.job["started"])
+
+
 class Handler(BaseHTTPRequestHandler):
-    store = None  # サーバー起動時に注入
+    store = None       # サーバー起動時に注入
+    jobs = None        # JobRunner
+    caps = {}          # この環境でできること
+    source_dir = ""    # 「ファイルを追加」で最初に開くディレクトリ
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -599,6 +865,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, 404)
             else:
                 self._send_json(data)
+        elif path == "/api/capabilities":
+            self._send_json({"capabilities": self.caps, "source_dir": self.source_dir})
+        elif path == "/api/sources":
+            d = (qs.get("dir") or [self.source_dir])[0]
+            self._send_json(self.store.list_sources(d))
+        elif path == "/api/artifacts":
+            name = (qs.get("name") or [""])[0]
+            if not self.store._safe(name):
+                self._send_json({"error": "bad_name"}, 400)
+            else:
+                self._send_json({"name": name, "artifacts": self.store.artifacts(name)})
+        elif path == "/api/job":
+            self._send_json({"job": self.jobs.snapshot()})
         elif path == "/audio":
             self._serve_audio((qs.get("name") or [""])[0])
         else:
@@ -653,6 +932,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, 404)
             else:
                 self._send_json({"ok": True, **result})
+        elif path == "/api/add-source":
+            body = self._read_body() or {}
+            result = self.store.add_source(body.get("dir") or self.source_dir,
+                                           body.get("file") or "",
+                                           body.get("mode") or "ask")
+            self._send_json({"ok": not result.get("error"), **result})
+        elif path == "/api/job":
+            body = self._read_body() or {}
+            do_t = bool(body.get("transcribe"))
+            do_d = bool(body.get("diarize"))
+            # 入っていないものは走らせない。押してから失敗するのを避ける。
+            if do_t and not self.caps.get("transcribe_mlx"):
+                self._send_json({"error": "no_transcriber"}, 400)
+                return
+            if do_d and not self.caps.get("diarize"):
+                self._send_json({"error": "no_diarizer"}, 400)
+                return
+            result = self.jobs.start(body.get("name") or name, do_t, do_d,
+                                     body.get("speakers"), body.get("model")) or {}
+            self._send_json({"ok": not result.get("error"), **result})
         else:
             self._send_json({"error": "unknown"}, 404)
 
@@ -665,15 +964,24 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--replacements", default=DEFAULT_REPLACEMENTS,
                         help="置換辞書のJSON（既定: リポジトリ直下の replacements.json）")
+    parser.add_argument("--source-dir", default=os.path.expanduser("~"),
+                        help="「ファイルを追加」で最初に開くディレクトリ")
     args = parser.parse_args()
 
     Handler.store = Store(args.dir, args.replacements)
+    Handler.jobs = JobRunner(Handler.store)
+    Handler.caps = capabilities()
+    Handler.source_dir = os.path.abspath(os.path.expanduser(args.source_dir))
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = "http://%s:%d/" % (args.host, args.port)
     print("アノテーターを起動しました:", url)
     print("対象ディレクトリ:", Handler.store.data_dir)
     print("置換辞書:", Handler.store.replacements_path,
           "(%d件)" % len(Handler.store.load_replacements()))
+    # 文字起こしと話者分離は「あれば使う」。無くてもアノテーターは動く。
+    ready = [k for k, v in Handler.caps.items() if v and k != "ffprobe"]
+    print("この環境でできること:", "／".join(ready) if ready
+          else "アノテーションのみ（文字起こし・話者分離のツールは未導入）")
     print("停止するには Ctrl+C")
     try:
         server.serve_forever()

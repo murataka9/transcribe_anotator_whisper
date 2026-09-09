@@ -127,7 +127,10 @@ async function loadProjectList() {
   for (const p of j.projects) {
     const opt = document.createElement("option");
     opt.value = p.name;
-    opt.textContent = p.name + (p.annotated ? " ●" : "") + (p.audio ? "" : " (音声なし)");
+    // 文字起こしがまだのものも一覧に出る。ここに出ないと処理を始められない。
+    opt.textContent = p.name + (p.annotated ? " ●" : "")
+                    + (p.transcribed ? "" : "（未文字起こし）")
+                    + (p.audio ? "" : "（音声なし）");
     sel.appendChild(opt);
   }
   const last = localStorage.getItem("lastProject");
@@ -155,10 +158,18 @@ async function loadProject(name) {
   audio.playbackRate = parseFloat($("rate").value);
   $("optMerge").checked = !!state.options.merge;
   $("optTime").checked = !!state.options.timecodes;
-  $("emptyMsg").style.display = "none";
   setSaveState("");
   renderRoles();
-  renderSegments();
+  if (state.transcribed === false) {
+    // 音声だけ置かれている状態。行が無いので、次にやることを出す。
+    $("segments").innerHTML = "";
+    $("emptyMsg").innerHTML =
+      "この収録はまだ文字起こしされていません。<br>ヘッダーの「文字起こし」から実行できます。";
+    $("emptyMsg").style.display = "block";
+  } else {
+    $("emptyMsg").style.display = "none";
+    renderSegments();
+  }
   syncSpeakerCount();
 }
 
@@ -803,10 +814,13 @@ $("replOverlay").addEventListener("click", (e) => { if (e.target.id === "replOve
 // Escape はどのダイアログでも閉じる。手前（後から開いたもの）から順に。
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  for (const id of ["rolesOverlay", "diarOverlay", "replOverlay"]) {
+  for (const id of ["confirmOverlay", "jobOverlay", "rolesOverlay", "diarOverlay", "replOverlay"]) {
     if (!$(id).hidden) {
       e.stopPropagation();
-      ({ rolesOverlay: closeRoles, diarOverlay: closeDiar, replOverlay: closeRepl })[id]();
+      // 確認ダイアログは「やめる」と同じ扱い。Escape で消えて勝手に進むことはない。
+      ({ confirmOverlay: () => $("confirmCancel").click(),
+         jobOverlay: closeJob,
+         rolesOverlay: closeRoles, diarOverlay: closeDiar, replOverlay: closeRepl })[id]();
       return;
     }
   }
@@ -1033,3 +1047,241 @@ $("diarBtn").addEventListener("click", openDiar);
 $("diarClose").addEventListener("click", closeDiar);
 $("diarApply").addEventListener("click", applyDiar);
 $("diarOverlay").addEventListener("click", (e) => { if (e.target.id === "diarOverlay") closeDiar(); });
+
+// ------------------------------------------------------------------ 文字起こし・話者分離
+// 実行はサーバー側の別プロセス。状態もサーバーが持つので、ページを閉じて
+// 開き直しても進捗に戻れる。
+let caps = null;         // この環境でできること
+let jobPoll = null;      // 進捗のポーリング
+let jobTarget = null;    // いま処理しようとしている収録
+
+function fmtDur(sec) {
+  if (sec === null || sec === undefined) return "";
+  sec = Math.round(sec);
+  return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+}
+
+async function ensureCaps() {
+  if (caps) return caps;
+  const r = await fetch("/api/capabilities");
+  const j = await r.json();
+  caps = j.capabilities || {};
+  caps.source_dir = j.source_dir || "";
+  return caps;
+}
+
+/** 上書きの確認。「上書き」なら "overwrite"、「両方残す」なら "keep_both"、
+ *  やめたら null を返す。黙って消さないための共通ダイアログ。 */
+function confirmOverwrite(title, html, opts) {
+  opts = opts || {};
+  return new Promise((resolve) => {
+    $("confirmTitle").textContent = title;
+    $("confirmBody").innerHTML = html;
+    $("confirmKeep").hidden = !opts.allowKeepBoth;
+    $("confirmOver").textContent = opts.overwriteLabel || "上書きする";
+    $("confirmOverlay").hidden = false;
+    const done = (v) => {
+      $("confirmOverlay").hidden = true;
+      $("confirmCancel").onclick = $("confirmKeep").onclick = $("confirmOver").onclick = null;
+      resolve(v);
+    };
+    $("confirmCancel").onclick = () => done(null);
+    $("confirmKeep").onclick = () => done("keep_both");
+    $("confirmOver").onclick = () => done("overwrite");
+  });
+}
+
+async function openJob() {
+  await ensureCaps();
+  $("jobOverlay").hidden = false;
+  $("jobSourceDir").value = $("jobSourceDir").value || caps.source_dir || "";
+  setJobTarget(state && state.has_audio ? state.name : null);
+  await loadSources();
+  await pollJob();          // 走っている最中に開いたら進捗を出す
+}
+
+function closeJob() {
+  $("jobOverlay").hidden = true;
+  if (jobPoll) { clearInterval(jobPoll); jobPoll = null; }
+}
+
+async function loadSources() {
+  const box = $("jobSourceList");
+  box.innerHTML = '<div class="repl-empty">読み込み中…</div>';
+  const r = await fetch("/api/sources?dir=" + encodeURIComponent($("jobSourceDir").value));
+  const j = await r.json();
+  box.innerHTML = "";
+  if (j.error === "not_a_dir") {
+    box.innerHTML = '<div class="repl-empty">そのディレクトリはありません。</div>';
+    return;
+  }
+  if (!j.files.length) {
+    box.innerHTML = '<div class="repl-empty">音声ファイルが見つかりません。</div>';
+    return;
+  }
+  for (const f of j.files) {
+    const row = document.createElement("div");
+    row.className = "src-row";
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = f.file;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = [f.duration ? fmtDur(f.duration) : "",
+                        (f.size / 1048576).toFixed(1) + "MB",
+                        f.exists ? "すでにある" : ""].filter(Boolean).join(" / ");
+    const btn = document.createElement("button");
+    btn.textContent = "追加する";
+    btn.addEventListener("click", () => addSource(j.dir, f.file));
+    row.appendChild(name); row.appendChild(meta); row.appendChild(btn);
+    box.appendChild(row);
+  }
+}
+
+async function addSource(dir, file, mode) {
+  const r = await fetch("/api/add-source", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dir, file, mode: mode || "ask" }),
+  });
+  const j = await r.json();
+  if (j.error === "exists") {
+    const items = (j.artifacts || []).map((a) => "<li>" + a.label + "：" + a.file + "</li>").join("");
+    const choice = await confirmOverwrite(
+      "同じ名前の収録があります",
+      "<strong>" + j.name + "</strong> は既に取り込まれています。<br>" +
+      "上書きすると、下のものが消えます。" +
+      (items ? "<ul>" + items + "</ul>" : "<ul><li>音声のみ</li></ul>"),
+      { allowKeepBoth: true });
+    if (!choice) return;
+    return addSource(dir, file, choice);
+  }
+  if (!j.ok) { toast("追加できませんでした"); return; }
+  toast("追加しました: " + j.file);
+  await loadProjectList();
+  await loadSources();
+  setJobTarget(j.name);
+}
+
+/** 処理の対象を決め、チェックボックスの初期状態をその収録の状況で決める。 */
+async function setJobTarget(name) {
+  jobTarget = name;
+  $("jobRun").hidden = !name;
+  if (!name) { $("jobNote").textContent = "追加する音声を選んでください。"; return; }
+
+  const r = await fetch("/api/project?name=" + encodeURIComponent(name));
+  const p = r.ok ? await r.json() : {};
+  $("jobTarget").innerHTML = "対象: <strong>" + name + "</strong>";
+
+  const tBox = $("jobDoTranscribe"), dBox = $("jobDoDiarize");
+  // 既にあるものは既定でオフ。押した瞬間に消えるのを避ける。
+  tBox.checked = !p.transcribed;
+  dBox.checked = !p.diarization;
+  tBox.disabled = !caps.transcribe_mlx;
+  dBox.disabled = !caps.diarize;
+  $("jobModel").disabled = !caps.transcribe_mlx;
+  $("jobSpeakers").disabled = !caps.diarize;
+
+  const missing = [];
+  if (!caps.transcribe_mlx) missing.push("文字起こし（mlx-whisper が未導入、または Mac ではない）");
+  if (!caps.diarize) missing.push("話者分離（pyannote.audio が未導入）");
+  const warn = $("jobWarn");
+  const notes = [];
+  if (missing.length) notes.push("この環境では使えません: " + missing.join(" / "));
+  if (p.transcribed) notes.push("文字起こしは既にあります。やり直すと、手で直した本文と話者ラベルが消えます。");
+  if (p.diarization) notes.push("話者分離の結果は既にあります。");
+  warn.innerHTML = notes.map((t) => "・" + t).join("<br>");
+  warn.hidden = !notes.length;
+  $("jobNote").textContent = "";
+  updateEstimates(p);
+}
+
+function updateEstimates(p) {
+  // 目安は実測から（文字起こし 4.6倍速 / 話者分離 12倍速）
+  const dur = (p && p.duration) || (state && state.name === jobTarget && audio.duration) || null;
+  $("jobTEst").textContent = dur ? "約 " + fmtDur(dur / 4.6) : "";
+  $("jobDEst").textContent = dur ? "約 " + fmtDur(dur / 12) : "";
+}
+
+async function startJob() {
+  if (!jobTarget) { toast("対象がありません"); return; }
+  const doT = $("jobDoTranscribe").checked, doD = $("jobDoDiarize").checked;
+  if (!doT && !doD) { toast("実行する処理を選んでください"); return; }
+
+  if (doT) {
+    const r = await fetch("/api/artifacts?name=" + encodeURIComponent(jobTarget));
+    const a = (await r.json()).artifacts || [];
+    if (a.length) {
+      const items = a.map((x) => "<li>" + x.label + "：" + x.file + "</li>").join("");
+      const choice = await confirmOverwrite(
+        "作り直すと消えるものがあります",
+        "<strong>" + jobTarget + "</strong> を文字起こしし直します。<br>" +
+        "下のものが作り直され、<strong>手で直した本文と話者ラベルは戻せません</strong>。" +
+        "<ul>" + items + "</ul>",
+        { allowKeepBoth: false, overwriteLabel: "作り直す" });
+      if (!choice) return;
+    }
+  }
+
+  const speakers = $("jobSpeakers").value;
+  const res = await fetch("/api/job", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: jobTarget, transcribe: doT, diarize: doD,
+                           speakers: speakers ? Number(speakers) : null,
+                           model: $("jobModel").value || null }),
+  });
+  const j = await res.json();
+  if (!j.ok) {
+    toast(j.error === "busy" ? "別の処理が動いています: " + j.running : "開始できませんでした");
+    return;
+  }
+  renderJob(j);
+  if (!jobPoll) jobPoll = setInterval(pollJob, 2000);
+}
+
+async function pollJob() {
+  const r = await fetch("/api/job");
+  const j = (await r.json()).job;
+  if (!j) { $("jobProgress").hidden = true; return; }
+  renderJob(j);
+  if (j.status === "running" && !jobPoll) jobPoll = setInterval(pollJob, 2000);
+  if (j.status !== "running" && jobPoll) {
+    clearInterval(jobPoll); jobPoll = null;
+    await loadProjectList();
+    if (j.status === "done") {
+      toast("完了しました: " + j.name);
+      await loadProject(j.name);
+      $("projectSel").value = j.name;
+      await setJobTarget(j.name);
+    }
+  }
+}
+
+function renderJob(j) {
+  const box = $("jobProgress");
+  box.hidden = false;
+  const total = j.stages.reduce((a, s) => a + (s.estimate || 0), 0);
+  const doneEst = j.stages.filter((s) => s.status === "done")
+                          .reduce((a, s) => a + (s.estimate || 0), 0);
+  const pct = total ? Math.min(99, Math.round(100 * Math.max(doneEst, j.elapsed) / total)) : 0;
+  const mark = { waiting: "・", running: "▶", done: "✓", failed: "×" };
+  const lines = j.stages.map((s) =>
+    '<div class="stage">' + (mark[s.status] || "・") + " " + s.label +
+    (s.status === "running" ? "（実行中）" : "") +
+    (s.estimate ? " <span class='muted-sm'>約 " + fmtDur(s.estimate) + "</span>" : "") +
+    "</div>").join("");
+  const bar = j.status === "running"
+    ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : "";
+  const head = j.status === "running"
+    ? "経過 " + fmtDur(j.elapsed) + (total ? " / 目安 " + fmtDur(total) : "")
+    : (j.status === "done" ? "完了（" + fmtDur(j.elapsed) + "）"
+                           : "失敗しました：" + (j.error || ""));
+  box.innerHTML = "<div><strong>" + head + "</strong></div>" + bar + lines +
+                  '<div class="log">' + (j.log || []).slice(-4).join("\n") + "</div>";
+}
+
+$("jobBtn").addEventListener("click", openJob);
+$("jobClose").addEventListener("click", closeJob);
+$("jobStart").addEventListener("click", startJob);
+$("jobBrowse").addEventListener("click", loadSources);
+$("jobSourceDir").addEventListener("keydown", (e) => { if (e.key === "Enter") loadSources(); });
+$("jobOverlay").addEventListener("click", (e) => { if (e.target.id === "jobOverlay") closeJob(); });
