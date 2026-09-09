@@ -21,6 +21,28 @@ function fmt(t) {
   const m = Math.floor(t / 60), s = Math.floor(t % 60);
   return m + ":" + String(s).padStart(2, "0");
 }
+// 行の時刻表示用（分:秒.小数）。編集時の精度を保つため fmt() より細かい。
+function fmtPrecise(t) {
+  if (!isFinite(t) || t < 0) t = 0;
+  const m = Math.floor(t / 60);
+  const s = t - m * 60;
+  return m + ":" + s.toFixed(2).padStart(5, "0");
+}
+// "1:02.50" / "62.5" / "62.5s" などを秒数へ。解釈できなければ null。
+function parseTimeInput(str) {
+  str = (str || "").trim().replace(/s$/i, "");
+  if (!str) return null;
+  if (str.includes(":")) {
+    const parts = str.split(":");
+    if (parts.length !== 2) return null;
+    const m = Number(parts[0]);
+    const s = Number(parts[1]);
+    if (!isFinite(m) || !isFinite(s) || m < 0 || s < 0) return null;
+    return m * 60 + s;
+  }
+  const v = Number(str);
+  return isFinite(v) && v >= 0 ? v : null;
+}
 /** ボタンに出す短縮名。頭2文字だけ（絵文字などのサロゲートペアも壊さない） */
 function shortRole(role) {
   return Array.from(role || "").slice(0, 2).join("");
@@ -169,6 +191,12 @@ function renderRoles() {
 function renderSegments() {
   const box = $("segments");
   box.innerHTML = "";
+  const topAdd = document.createElement("button");
+  topAdd.className = "add-row-btn";
+  topAdd.textContent = "＋ 先頭に行を追加";
+  topAdd.title = "最初のセリフより前に、聞き取れていない発話を追加";
+  topAdd.addEventListener("click", () => insertSegAt(0));
+  box.appendChild(topAdd);
   const frag = document.createDocumentFragment();
   state.segments.forEach((seg, idx) => frag.appendChild(buildSeg(seg, idx)));
   box.appendChild(frag);
@@ -177,15 +205,10 @@ function renderSegments() {
 
 function buildSeg(seg, idx) {
   const row = document.createElement("div");
-  row.className = "seg";
+  row.className = "seg" + (seg.manual ? " manual" : "");
   row.dataset.idx = idx;
 
-  const time = document.createElement("div");
-  time.className = "time";
-  time.textContent = fmt(seg.start);
-  time.title = "クリックでこの位置から再生";
-  time.addEventListener("click", (e) => { e.stopPropagation(); seek(seg.start, true); setActive(idx); });
-  row.appendChild(time);
+  row.appendChild(buildTimeCell(seg, idx));
 
   // ロールは常に2段に並べる。名前は頭2文字だけ出し、番号（キーボードの数字キー）を
   // 添える。「インタビュアー」と「インタビュイー」は2文字だと区別が付かないため。
@@ -233,14 +256,15 @@ function buildSeg(seg, idx) {
 
   const ops = document.createElement("div");
   ops.className = "ops";
-  const splitB = mkOp("分割", "カーソル位置で分割", () => splitSeg(idx));
+  const splitB = mkOp("分割", "カーソル位置で分割（再生中ならその時刻を境界に使用）", () => splitSeg(idx));
   const mergeB = mkOp("↑結合", "上の行と結合", () => mergeUp(idx));
+  const addB = mkOp("＋行", "この行の後に、聞き取れていない発話用の行を追加", () => insertSegAt(idx + 1));
   const delB = mkOp("削除", "この行を削除 (D)", () => deleteSeg(idx));
-  ops.appendChild(dictB); ops.appendChild(splitB); ops.appendChild(mergeB); ops.appendChild(delB);
+  ops.appendChild(dictB); ops.appendChild(splitB); ops.appendChild(mergeB); ops.appendChild(addB); ops.appendChild(delB);
   row.appendChild(ops);
 
   row.addEventListener("mousedown", (e) => {
-    if (e.target.closest("button") || e.target.classList.contains("text")) return;
+    if (e.target.closest("button") || e.target.classList.contains("text") || e.target.classList.contains("t-val")) return;
     setActive(idx);
   });
   return row;
@@ -250,6 +274,126 @@ function mkOp(label, title, fn) {
   b.textContent = label; b.title = title;
   b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
   return b;
+}
+
+// --- 時刻セル（開始/終了を個別に編集・再生位置から設定） ------------
+function buildTimeCell(seg, idx) {
+  const cell = document.createElement("div");
+  cell.className = "time-cell";
+
+  ["start", "end"].forEach((field) => {
+    const trow = document.createElement("div");
+    trow.className = "t-row";
+
+    const val = document.createElement("span");
+    val.className = "t-val";
+    val.contentEditable = "false";
+    val.spellcheck = false;
+    val.textContent = fmtPrecise(seg[field]);
+    val.title = "クリック: この位置へ移動 / ダブルクリック: 時刻を直接編集";
+    val.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (val.isContentEditable) return;
+      seek(seg[field], true);
+      setActive(idx);
+    });
+    val.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      beginEditTime(val, idx, field);
+    });
+    trow.appendChild(val);
+
+    const setB = document.createElement("button");
+    setB.className = "t-set";
+    setB.textContent = "●";
+    setB.title = (field === "start" ? "開始" : "終了") + "時刻を今の再生位置に合わせる";
+    setB.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setTimeFromPlayback(idx, field);
+    });
+    trow.appendChild(setB);
+
+    cell.appendChild(trow);
+  });
+
+  if (seg.manual) {
+    const badge = document.createElement("span");
+    badge.className = "badge-manual";
+    badge.textContent = "追加";
+    badge.title = "手動で追加した行";
+    cell.appendChild(badge);
+  }
+  return cell;
+}
+
+function beginEditTime(el, idx, field) {
+  el.contentEditable = "true";
+  el.classList.add("editing");
+  el.focus();
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+
+  const onKey = (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") { e.preventDefault(); el.blur(); }
+    else if (e.key === "Escape") {
+      e.preventDefault();
+      el.textContent = fmtPrecise(state.segments[idx][field]);
+      el.blur();
+    }
+  };
+  const onBlur = () => {
+    el.removeEventListener("keydown", onKey);
+    el.removeEventListener("blur", onBlur);
+    el.contentEditable = "false";
+    el.classList.remove("editing");
+    commitTimeEdit(idx, field, el.textContent);
+  };
+  el.addEventListener("keydown", onKey);
+  el.addEventListener("blur", onBlur);
+}
+
+function commitTimeEdit(idx, field, text) {
+  const seg = state.segments[idx];
+  const val = parseTimeInput(text);
+  if (val === null) { toast("時刻を解釈できません（例: 12.5 や 1:02.50）"); refreshRow(idx); return; }
+  if (field === "start" && val >= seg.end) { toast("開始は終了より前にしてください"); refreshRow(idx); return; }
+  if (field === "end" && val <= seg.start) { toast("終了は開始より後にしてください"); refreshRow(idx); return; }
+  pushUndo("時刻編集");
+  seg[field] = val;
+  refreshRow(idx);
+  scheduleSave();
+}
+
+function setTimeFromPlayback(idx, field) {
+  if (!state.has_audio) { toast("音声がありません"); return; }
+  commitTimeEdit(idx, field, String(audio.currentTime));
+}
+
+// 聞き取れていない発話を挿入する。insertIdx の位置に空行を差し込む。
+function insertSegAt(insertIdx) {
+  pushUndo("追加");
+  const prev = state.segments[insertIdx - 1];
+  const next = state.segments[insertIdx];
+  const start = prev ? prev.end : Math.max(0, (next ? next.start : 1.5) - 1.5);
+  let end = (next && next.start > start) ? Math.min(next.start, start + 1.5) : start + 1.5;
+  if (end <= start) end = start + 0.5;
+  const seg = {
+    id: Date.now() + insertIdx, start, end,
+    text: "", original: null, role: null, manual: true,
+  };
+  state.segments.splice(insertIdx, 0, seg);
+  renderSegments();
+  setActive(insertIdx);
+  scheduleSave();
+  toast("行を追加しました。時刻を調整し、テキストを入力してください（⌘Z で取り消し）");
+  requestAnimationFrame(() => {
+    const el = document.querySelector('.seg[data-idx="' + insertIdx + '"] .text');
+    if (el) el.focus();
+  });
 }
 
 // ------------------------------------------------------------------ 行操作
@@ -300,8 +444,14 @@ function splitSeg(idx) {
   if (pos === null || pos <= 0 || pos >= text.length) pos = Math.floor(text.length / 2);
   if (text.length < 2) { toast("分割できません"); return; }
   pushUndo("分割");
-  const ratio = pos / text.length;
-  const boundary = seg.start + (seg.end - seg.start) * ratio;
+  let boundary;
+  const t = audio.currentTime;
+  if (state.has_audio && t > seg.start && t < seg.end) {
+    boundary = t; // 再生位置がこの行の範囲内なら、それを境界として使う（文字数比率より正確）
+  } else {
+    const ratio = pos / text.length;
+    boundary = seg.start + (seg.end - seg.start) * ratio;
+  }
   const first = { ...seg, text: text.slice(0, pos).trim(), end: boundary };
   const second = {
     id: Date.now() + idx, start: boundary, end: seg.end,
@@ -456,6 +606,7 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.key === "d" || e.key === "D") { e.preventDefault(); deleteSeg(activeIdx); return; }
+  if (e.key === "i" || e.key === "I") { e.preventDefault(); insertSegAt(activeIdx + 1); return; }
   if (e.key === "r" || e.key === "R") { e.preventDefault(); seek(state.segments[activeIdx].start, true); return; }
   if (e.key === "ArrowLeft") { e.preventDefault(); seek(audio.currentTime - 3, false); return; }
   if (e.key === "ArrowRight") { e.preventDefault(); seek(audio.currentTime + 3, false); return; }
