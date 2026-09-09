@@ -2,12 +2,14 @@
 
 音声インタビューを **文字起こし → 話者ラベル付け・誤字修正 → テキスト書き出し** するためのローカルツール一式です。
 
-4つのスクリプトから成ります。文字起こしは `transcribe.py` か `diarize_d1.py` の
-どちらかで作り（話者分離が要るなら後者）、外で作ったものは `import_whisper.py` で取り込みます。
+6つのスクリプトから成ります。文字起こしは環境で選びます（**Mac なら `transcribe_mlx.py`**、
+GPU 機なら `transcribe.py` か `diarize_d1.py`）。外で作ったものは `import_whisper.py` で取り込みます。
 
 | スクリプト | 役割 |
 | --- | --- |
 | `transcribe.py` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) を使い、ディレクトリ内の音声を一括で文字起こし |
+| `transcribe_mlx.py` | **Apple Silicon の GPU で文字起こし（Mac ならこちら）** |
+| `diarize_local.py` | 文字起こし済みの音声に、話者分離だけをローカルで足す |
 | `diarize_d1.py` | 文字起こしの本文を変えずに話者分離を足す（推奨パイプライン） |
 | `import_whisper.py` | 外で作った文字起こし（JSON/SRT）を `recordings/` に取り込む |
 | `annotator.py` | 文字起こしと音声をブラウザ上で並べ、発話者ロールのラベル付け・誤字修正・書き出しを行うGUI |
@@ -28,10 +30,13 @@ Python 3.12 で動作確認しています。
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install faster-whisper
+pip install faster-whisper          # 文字起こし（CPU / NVIDIA GPU）
+pip install mlx-whisper             # 文字起こし（Apple GPU。Mac のとき）
+pip install "pyannote.audio>=4.0"   # 話者分離をローカルで回すとき
 ```
 
-- `annotator.py` は **Python標準ライブラリのみ**で動くため、追加インストールは不要です（`faster-whisper` は文字起こし用）。
+- `annotator.py` は **Python標準ライブラリのみ**で動くため、追加インストールは不要です（上の3つは文字起こしと話者分離のためのものです）。
+- **必要なものだけ入れれば動きます。** Mac で完結させるなら `mlx-whisper` と `pyannote.audio` の2つ、GPU 機で D1 を回すなら `faster-whisper` と `whisperx` です。
 - Whisperモデルは `./model/` に配置します（CTranslate2形式）。`recordings/` と `model/` は `.gitignore` 済みで、音声・文字起こし・モデルはコミットされません。
 
 ### モデルは `large-v3` を推奨します
@@ -98,6 +103,36 @@ python transcribe.py recordings --device cuda
 - `<名前>_text.txt` … テキストのみ
 
 例: `recordings/P7.m4a` → `recordings/P7_timecoded.txt`, `recordings/P7_text.txt`
+
+### Mac で文字起こしする（`transcribe_mlx.py`）
+
+**Apple Silicon なら `transcribe.py` ではなくこちらを使ってください。** MLX で
+Apple GPU を使います。M4 での実測（116秒の日本語音声）です。
+
+| 方式 | 速度 | 30分換算 |
+| --- | ---: | ---: |
+| **`transcribe_mlx.py`（MLX large-v3 / Apple GPU）** | **4.6倍速** | **約6.5分** |
+| `transcribe.py` を int8 にした場合（CPU） | 1.2倍速 | 約24分 |
+| `transcribe.py` の既定 float32（CPU） | 0.70倍速 | 約43分 |
+
+`transcribe.py` の既定は Mac で**音声より時間がかかります**（0.70倍速）。
+CTranslate2 に Metal 対応が無く CPU に落ちるためで、モデルの差ではありません。
+
+```bash
+pip install mlx-whisper
+python transcribe_mlx.py recordings          # ディレクトリごと
+python transcribe_mlx.py 音声.m4a            # 1本だけ
+```
+
+`transcribe.py` と同じ `<名前>_timecoded.txt` と `<名前>_text.txt` に加えて、
+**`<名前>.words.json`（単語ごとの時刻）**を書きます。これは `diarize_local.py` が
+話者を細かく付けるために使うもので、人が読むものではありません。
+
+**量子化版（`-4bit` / `-8bit`）と turbo は使いません。**日本語の固有名詞が
+落ちるためです（turbo の実例は上の比較表のとおり）。
+
+既に結果があるファイルは**書き換えません**。作り直すときだけ `--overwrite` を
+付けてください。手で直した本文を失わないための歯止めです。
 
 ### 外で作った文字起こしを取り込む（`import_whisper.py`）
 
@@ -235,6 +270,47 @@ turbo との差は固有名詞に出ます。
 | PTC**J**L / PTC**G**L と割れる | 両方 PTCGL |
 | 紙で読むのと**伝書籍**で | 紙で読むのと**電子書籍**で |
 
+#### ローカルで話者分離だけ足す（`diarize_local.py`）
+
+**文字起こしが既にあるとき**は、話者分離だけを回せます。`diarize_d1.py` が
+whisperx とモデル 5.3GB を要求して実質 CUDA 専用なのに対し、こちらは
+**pyannote だけ・モデル 32MB**。Apple Silicon の GPU（MPS）で動きます。
+
+```bash
+python diarize_local.py 音声.m4a --speakers 5   # 人数が分かっているとき
+python diarize_local.py 音声.m4a                # 自動推定
+```
+
+M4 での実測は **12倍速**（30分の音声が約2分半）。`--speakers` で**人数を固定
+したほうが精度が出ます**。分からなければ省略すると pyannote が推定します。
+
+出力は隣に置いてある単語の時刻で変わります。
+
+| ある | 出力 | 中身 |
+| --- | --- | --- |
+| `<名前>.words.json` | `<名前>.json` | 単語ごとに話者。**迷い印が少ない** |
+| 無し | `<名前>.rttm` | 話者区間だけ |
+
+**単語の時刻があるほうが良い結果になります。**行の時刻だけで決めると、
+Whisper の行の切れ目のずれぶん隣の話者が窓に漏れ込み、票が割れるためです。
+同じ30分のインタビューで比べると、**話者の結論は94%一致するのに、迷い印は
+23行 → 95行**に増えました。`transcribe_mlx.py` が `.words.json` を出すのは
+このためです。`import_whisper.py` で取り込んだだけの収録には単語の時刻が
+無いので、RTTM になります（動きますが迷い印は多めに出ます）。
+
+#### D1 とローカルの使い分け
+
+| | `diarize_d1.py` | `transcribe_mlx.py` + `diarize_local.py` |
+| --- | --- | --- |
+| 動く場所 | NVIDIA GPU（実質） | **Mac の GPU** |
+| 文字起こし | faster-whisper large-v3 | MLX large-v3 |
+| 単語の時刻 | wav2vec2 で補正 | Whisper 自身の word_timestamps |
+| モデル容量 | 約5.3GB | 2.9GB + 32MB |
+| 本文 | **B1 と完全一致** | MLX の本文（B1 とは別物） |
+
+**精度を突き詰めるなら D1 のままです。**ローカル版は Mac だけで完結することと
+速さのための選択肢で、D1 の置き換えではありません。
+
 #### 必要なもの
 
 `diarize_d1.py` は `whisperx` と HuggingFace のトークンが要ります（pyannote は
@@ -246,6 +322,13 @@ export HF_TOKEN=hf_xxx        # または ~/.config/whisperx/hf_token に置く
 ```
 
 CPU でも `--device cpu` で動きますが、実用的な速度は出ません。
+
+**トークンは初回だけです。** pyannote の `speaker-diarization-community-1` は
+単一のチェックポイントなので、一度取得すればキャッシュから読めます。
+`diarize_d1.py` も `diarize_local.py` も、トークンが見つからなければ自動で
+`HF_HUB_OFFLINE=1` に切り替えてキャッシュを読みます。初回はゲートへの同意が
+必要なので、[モデルのページ](https://huggingface.co/pyannote/speaker-diarization-community-1)
+で同意してからトークンを渡してください。
 
 #### 使い方
 
@@ -355,7 +438,9 @@ CPU でも `--device cpu` で動きますが、実用的な速度は出ません
 ## ファイル構成
 
 ```
-transcribe.py            文字起こしスクリプト
+transcribe.py            文字起こしスクリプト（faster-whisper / CPU・CUDA）
+transcribe_mlx.py        文字起こしスクリプト（MLX / Apple GPU。Mac ならこちら）
+diarize_local.py         話者分離だけをローカルで行う（pyannote のみ・32MB）
 import_whisper.py        外で作った文字起こし（JSON/SRT）を recordings/ に取り込む
 diarize_d1.py            推奨の話者分離パイプライン（本文を変えずに話者を足す）
 annotator.py             アノテーターのローカルサーバー（標準ライブラリのみ）
