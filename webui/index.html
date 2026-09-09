@@ -143,11 +143,11 @@
         <label class="job-row">
           <input type="checkbox" id="jobDoTranscribe">
           <span class="job-label">文字起こし</span>
-          <select id="jobModel" title="使うモデル">
-            <option value="">MLX large-v3（Apple GPU）</option>
-          </select>
+          <!-- 選択肢は models.json から作る（fillModels） -->
+          <select id="jobModel" title="使うモデル"></select>
           <span class="muted-sm" id="jobTEst"></span>
         </label>
+        <div class="job-note muted-sm" id="jobModelNote"></div>
         <label class="job-row">
           <input type="checkbox" id="jobDoDiarize">
           <span class="job-label">話者分離</span>

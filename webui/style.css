@@ -332,3 +332,4 @@ button.danger { background: #c0392b; color: #fff; border-color: #c0392b; }
   color: var(--accent);
   font-variant-numeric: tabular-nums;
 }
+.job-note { padding: 0 0 2px 94px; }

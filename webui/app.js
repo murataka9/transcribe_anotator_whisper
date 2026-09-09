@@ -1054,6 +1054,7 @@ $("diarOverlay").addEventListener("click", (e) => { if (e.target.id === "diarOve
 let caps = null;         // この環境でできること
 let jobPoll = null;      // 進捗のポーリング
 let jobTarget = null;    // いま処理しようとしている収録
+let jobProject = null;   // その収録の情報（長さなど。目安の計算に使う）
 
 function fmtDur(sec) {
   if (sec === null || sec === undefined) return "";
@@ -1077,7 +1078,26 @@ async function ensureCaps() {
   }
   caps = j.capabilities || {};
   caps.source_dir = j.source_dir || "";
+  caps.models = j.models || [];
+  fillModels(caps.models);
   return caps;
+}
+
+/** モデルの選択肢を models.json の内容で作る。増やすのは JSON 側の仕事。 */
+function fillModels(models) {
+  const sel = $("jobModel");
+  const keep = sel.value;
+  sel.innerHTML = "";
+  for (const m of models) {
+    const o = document.createElement("option");
+    o.value = m.model;
+    o.textContent = m.label;
+    o.title = m.note || m.model;
+    sel.appendChild(o);
+  }
+  if (keep && models.some((m) => m.model === keep)) sel.value = keep;
+  $("jobModelNote").textContent =
+    (models.find((m) => m.model === sel.value) || {}).note || "";
 }
 
 /** 上書きの確認。「上書き」なら "overwrite"、「両方残す」なら "keep_both"、
@@ -1179,11 +1199,13 @@ async function addSource(dir, file, mode) {
 /** 処理の対象を決め、チェックボックスの初期状態をその収録の状況で決める。 */
 async function setJobTarget(name) {
   jobTarget = name;
+  jobProject = null;
   $("jobRun").hidden = !name;
   if (!name) { $("jobNote").textContent = "追加する音声を選んでください。"; return; }
 
   const r = await fetch("/api/project?name=" + encodeURIComponent(name));
   const p = r.ok ? await r.json() : {};
+  jobProject = p;
   $("jobTarget").innerHTML = "対象: <strong>" + name + "</strong>";
 
   const tBox = $("jobDoTranscribe"), dBox = $("jobDoDiarize");
@@ -1210,9 +1232,10 @@ async function setJobTarget(name) {
 }
 
 function updateEstimates(p) {
-  // 目安は実測から（文字起こし 4.6倍速 / 話者分離 12倍速）
+  // 目安は実測の倍速から。文字起こしはモデルで違うので models.json の値を使う。
   const dur = (p && p.duration) || (state && state.name === jobTarget && audio.duration) || null;
-  $("jobTEst").textContent = dur ? "約 " + fmtDur(dur / 4.6) : "";
+  const m = (caps.models || []).find((x) => x.model === $("jobModel").value);
+  $("jobTEst").textContent = dur ? "約 " + fmtDur(dur / ((m && m.speed) || 4.6)) : "";
   $("jobDEst").textContent = dur ? "約 " + fmtDur(dur / 12) : "";
 }
 
@@ -1245,7 +1268,9 @@ async function startJob() {
   });
   const j = await res.json();
   if (!j.ok) {
-    toast(j.error === "busy" ? "別の処理が動いています: " + j.running : "開始できませんでした");
+    toast(j.error === "busy" ? "別の処理が動いています: " + j.running
+        : j.error === "unknown_model" ? "models.json にないモデルです"
+        : "開始できませんでした");
     return;
   }
   renderJob(j);
@@ -1341,6 +1366,11 @@ $("jobBtn").addEventListener("click", openJob);
 $("jobClose").addEventListener("click", closeJob);
 $("jobStart").addEventListener("click", startJob);
 $("jobBrowse").addEventListener("click", loadSources);
+$("jobModel").addEventListener("change", () => {
+  const m = (caps.models || []).find((x) => x.model === $("jobModel").value) || {};
+  $("jobModelNote").textContent = m.note || "";
+  updateEstimates(jobProject);
+});
 $("jobSourceDir").addEventListener("keydown", (e) => { if (e.key === "Enter") loadSources(); });
 $("jobOverlay").addEventListener("click", (e) => { if (e.target.id === "jobOverlay") closeJob(); });
 

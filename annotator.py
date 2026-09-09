@@ -41,6 +41,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WEBUI_DIR = os.path.join(BASE_DIR, "webui")
 # 置換辞書はリポジトリ直下に置く（recordings/ は .gitignore なので共有できないため）
 DEFAULT_REPLACEMENTS = os.path.join(BASE_DIR, "replacements.json")
+# 画面で選べるモデルの一覧。実行のたびに読み直すので、足したらページの
+# 再読み込みだけで増える（サーバーの再起動は要らない）。
+MODELS_PATH = os.path.join(BASE_DIR, "models.json")
 
 AUDIO_EXTENSIONS = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".mp4")
 DEFAULT_ROLES = ["インタビュアー", "インタビュイー"]
@@ -79,6 +82,30 @@ def probe_duration(path):
         return round(float(out), 2)
     except Exception:
         return None
+
+
+DEFAULT_MODELS = [{"label": "MLX large-v3（Apple GPU）",
+                   "model": "mlx-community/whisper-large-v3-mlx",
+                   "speed": 4.6, "note": ""}]
+
+
+def load_models():
+    """models.json を読む。壊れていても既定に落ちて動き続ける。"""
+    try:
+        with open(MODELS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        rows = []
+        for m in data.get("transcribe", []):
+            model = (m.get("model") or "").strip()
+            if not model:
+                continue
+            rows.append({"label": m.get("label") or model,
+                         "model": model,
+                         "speed": float(m.get("speed") or 4.6),
+                         "note": m.get("note") or ""})
+        return rows or list(DEFAULT_MODELS)
+    except Exception:
+        return list(DEFAULT_MODELS)
 
 
 def capabilities():
@@ -604,6 +631,7 @@ class JobRunner:
     """
 
     # 実測値（M4 / 日本語）。残り時間の目安を出すのに使う。
+    # 文字起こしはモデルごとに違うので models.json の speed を優先する。
     RATE = {"transcribe": 4.6, "diarize": 12.0}
 
     def __init__(self, store):
@@ -632,8 +660,10 @@ class JobRunner:
         stages = []
         duration = probe_duration(audio)
         if do_transcribe:
+            rate = next((m["speed"] for m in load_models() if m["model"] == model),
+                        self.RATE["transcribe"])
             stages.append({"key": "transcribe", "label": "文字起こし", "status": "waiting",
-                           "estimate": round(duration / self.RATE["transcribe"]) if duration else None})
+                           "estimate": round(duration / rate) if duration else None})
         if do_diarize:
             stages.append({"key": "diarize", "label": "話者分離", "status": "waiting",
                            "estimate": round(duration / self.RATE["diarize"]) if duration else None})
@@ -866,7 +896,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(data)
         elif path == "/api/capabilities":
-            self._send_json({"capabilities": self.caps, "source_dir": self.source_dir})
+            # モデル一覧はここで読み直す。models.json に足したら再読み込みで増える。
+            self._send_json({"capabilities": self.caps, "source_dir": self.source_dir,
+                             "models": load_models()})
         elif path == "/api/sources":
             d = (qs.get("dir") or [self.source_dir])[0]
             self._send_json(self.store.list_sources(d))
@@ -949,8 +981,12 @@ class Handler(BaseHTTPRequestHandler):
             if do_d and not self.caps.get("diarize"):
                 self._send_json({"error": "no_diarizer"}, 400)
                 return
+            model = body.get("model") or None
+            if model and model not in [m["model"] for m in load_models()]:
+                self._send_json({"error": "unknown_model", "model": model}, 400)
+                return
             result = self.jobs.start(body.get("name") or name, do_t, do_d,
-                                     body.get("speakers"), body.get("model")) or {}
+                                     body.get("speakers"), model) or {}
             self._send_json({"ok": not result.get("error"), **result})
         else:
             self._send_json({"error": "unknown"}, 404)
