@@ -166,7 +166,11 @@ class Store:
             if name not in seen:
                 seen.add(name)
                 found.append(name)
-        for name in sorted(found):
+        # 「Las 2-A」が「Las 10-A」より前に来るよう、数字は数として比べる
+        def natural_key(s):
+            return [(0, int(t), "") if t.isdigit() else (1, 0, t.lower())
+                    for t in re.split(r"(\d+)", s)]
+        for name in sorted(found, key=natural_key):
             audio = self._find_audio(name)
             projects.append({
                 "name": name,
